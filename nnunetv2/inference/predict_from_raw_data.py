@@ -9,6 +9,8 @@ from threading import Thread
 from time import sleep
 from typing import Tuple, Union, List, Optional
 
+import medpy.metric as metric
+import json
 import numpy as np
 import torch
 from acvl_utils.cropping_and_padding.padding import pad_nd_image
@@ -396,7 +398,16 @@ class nnUNetPredictor(object):
                     proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
 
                 # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
-                prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                prediction = (
+                    self.predict_logits_from_preprocessed_data(
+                        data,
+                        ofile.replace(self.dataset_json["file_ending"], "")
+                        + "_dice_estimation.json",
+                    )
+                    .cpu()
+                    .detach()
+                    .numpy()
+                )
 
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
@@ -498,7 +509,7 @@ class nnUNetPredictor(object):
                 return ret
 
     @torch.inference_mode()
-    def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
+    def predict_logits_from_preprocessed_data(self, data: torch.Tensor, output_file_truncated: str) -> torch.Tensor:
         """
         IMPORTANT! IF YOU ARE RUNNING THE CASCADE, THE SEGMENTATION FROM THE PREVIOUS STAGE MUST ALREADY BE STACKED ON
         TOP OF THE IMAGE AS ONE-HOT REPRESENTATION! SEE PreprocessAdapter ON HOW THIS SHOULD BE DONE!
@@ -510,6 +521,7 @@ class nnUNetPredictor(object):
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
         prediction = None
 
+        prediction_per_fold = []
         for params in self.list_of_parameters:
 
             # messing with state dict names...
@@ -522,17 +534,93 @@ class nnUNetPredictor(object):
             # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
             # this actually saves computation time
             if prediction is None:
-                prediction = self.predict_sliding_window_return_logits(data).to('cpu')
+                prediction = self.predict_sliding_window_return_logits(data).to("cpu")
+                prediction_per_fold.append(prediction.argmax(0).numpy().astype(int))
             else:
-                prediction += self.predict_sliding_window_return_logits(data).to('cpu')
+                prediction_tmp = self.predict_sliding_window_return_logits(data).to(
+                    "cpu"
+                )
+                prediction_per_fold.append(prediction_tmp.argmax(0).numpy().astype(int))
+                prediction += prediction_tmp
 
         if len(self.list_of_parameters) > 1:
             prediction /= len(self.list_of_parameters)
+
+        self.estimate_dice(prediction, prediction_per_fold, output_file_truncated)
 
         if self.verbose:
             print('Prediction done')
         torch.set_num_threads(n_threads)
         return prediction
+
+    def estimate_dice(
+        self,
+        prediction: torch.Tensor,
+        prediction_per_fold: List[np.ndarray],
+        output_file_truncated,
+    ):
+        if len(prediction_per_fold) < 2:
+            # print('Can\'t predict structure wise dice with only one prediction')
+            return
+
+        json_file = output_file_truncated  # + '_dice_estimation.json'
+
+        data = {}
+        results = []
+
+        prediction_arg = prediction.argmax(0).numpy().astype(int)
+        labels = np.unique(prediction_arg)
+        prediction_per_fold_stack = np.stack(prediction_per_fold)
+
+        result = {}
+        for label in labels:
+            pred = prediction_arg == label
+            pred_fold = prediction_per_fold_stack == label
+
+            # calculate IoP and variation of it
+            IoU = np.count_nonzero(np.all(pred_fold, axis=0)) / (
+                np.count_nonzero(np.any(pred_fold, axis=0)) + np.finfo(float).eps
+            )
+            IoP = np.count_nonzero(np.all(pred_fold, axis=0)) / (
+                np.count_nonzero(pred) + np.finfo(float).eps
+            )
+            PoU = np.count_nonzero(pred) / (
+                np.count_nonzero(np.any(pred_fold, axis=0)) + np.finfo(float).eps
+            )
+
+            v = []  # calculate Coefficient of variation of the volume
+            for i in range(len(labels)):
+                v.append(np.count_nonzero(pred_fold[i]))
+            v = np.array(v)
+            CV = np.std(v) / (np.mean(v) + np.finfo(float).eps)
+
+            dc = []  # calculate average and median Dice
+            for i in range(len(labels)):
+                dc.append(metric.dc(pred_fold[i], pred))
+            dc = np.array(dc)
+            DCA = np.mean(dc)
+            DCM = np.median(dc)
+
+            result[int(label)] = {
+                "IoU": IoU,
+                "IoP": IoP,
+                "PoU": PoU,
+                "CV": CV,
+                "DCA": DCA,
+                "DCM": DCM,
+                "DIU": 2 * IoU / (IoU + 1),
+                "DIP": 2 * IoP / (IoP + 1),
+                "DPU": 2 * PoU / (PoU + 1),
+            }
+
+        result["test"] = output_file_truncated
+        results.append(result)
+
+        data["number_of_samples"] = len(prediction_per_fold)
+        data["results"] = results
+
+        with open(json_file, "w") as f:
+            json.dump(data, f, indent=4, sort_keys=False)
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
         slicers = []

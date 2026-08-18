@@ -35,6 +35,7 @@ dependencies = [
     "dynamic-network-architectures>=0.4.4,<0.5",
     "tqdm",
     "scipy",
+    "medpy",
     "batchgenerators>=0.25.1",
     "numpy>=1.24",
     "scikit-learn",

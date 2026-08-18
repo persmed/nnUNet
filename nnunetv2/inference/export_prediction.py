@@ -1,6 +1,7 @@
 from typing import Union, List
 
 import numpy as np
+import SimpleITK as sitk
 import torch
 from acvl_utils.cropping_and_padding.bounding_boxes import insert_crop_into_image
 from batchgenerators.utilities.file_and_folder_operations import load_json, save_pickle
@@ -90,24 +91,62 @@ def export_prediction_from_logits(predicted_array_or_file: Union[np.ndarray, tor
 
     label_manager = plans_manager.get_label_manager(dataset_json_dict_or_file)
     ret = convert_predicted_logits_to_segmentation_with_correct_shape(
-        predicted_array_or_file, plans_manager, configuration_manager, label_manager, properties_dict,
-        return_probabilities=save_probabilities, num_threads_torch=num_threads_torch
+        predicted_array_or_file,
+        plans_manager,
+        configuration_manager,
+        label_manager,
+        properties_dict,
+        return_probabilities=True,  # Changed from save_probabilities to True
+        num_threads_torch=num_threads_torch,
     )
     del predicted_array_or_file
 
+    # save entropy
+    segmentation_final, probabilities_final = ret
+    del ret
+
+    entropy_np = entropy(probabilities_final)
+    entropy_np[entropy_np < 1e-2] = 0
+    entropy_sitk = sitk.GetImageFromArray(entropy_np)
+    entropy_sitk.SetOrigin(properties_dict["sitk_stuff"]["origin"])
+    entropy_sitk.SetDirection(properties_dict["sitk_stuff"]["direction"])
+    entropy_sitk.SetSpacing(properties_dict["sitk_stuff"]["spacing"])
+    sitk.WriteImage(
+        entropy_sitk,
+        output_file_truncated.replace(dataset_json_dict_or_file["file_ending"], "")
+        + "_entropy"
+        + dataset_json_dict_or_file["file_ending"],
+    )
+
     # save
     if save_probabilities:
-        segmentation_final, probabilities_final = ret
-        np.savez_compressed(output_file_truncated + '.npz', probabilities=probabilities_final)
-        save_pickle(properties_dict, output_file_truncated + '.pkl')
-        del probabilities_final, ret
-    else:
-        segmentation_final = ret
-        del ret
+        np.savez_compressed(
+            output_file_truncated + ".npz", probabilities=probabilities_final
+        )
+        save_pickle(properties_dict, output_file_truncated + ".pkl")
+        del probabilities_final
 
     rw = plans_manager.image_reader_writer_class()
-    rw.write_seg(segmentation_final, output_file_truncated + dataset_json_dict_or_file['file_ending'],
-                 properties_dict)
+    rw.write_seg(
+        segmentation_final,
+        output_file_truncated + dataset_json_dict_or_file["file_ending"],
+        properties_dict,
+    )
+
+
+def entropy(array):
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
+        length = len(array)
+        a = np.zeros_like(array[0])
+
+        for x in array:
+            y = -x * np.log(x) * 1 / np.log(length)
+            a += np.nan_to_num(y, copy=True, nan=0.0, posinf=None, neginf=None)
+
+        return a
 
 
 def resample_and_save(predicted: Union[torch.Tensor, np.ndarray], target_shape: List[int], output_file: str,
