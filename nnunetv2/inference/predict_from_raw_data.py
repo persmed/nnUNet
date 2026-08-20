@@ -402,7 +402,9 @@ class nnUNetPredictor(object):
                     self.predict_logits_from_preprocessed_data(
                         data,
                         ofile.replace(self.dataset_json["file_ending"], "")
-                        + "_dice_estimation.json",
+                        + "_dice_estimation.json"
+                        if ofile is not None
+                        else None,
                     )
                     .cpu()
                     .detach()
@@ -509,7 +511,8 @@ class nnUNetPredictor(object):
                 return ret
 
     @torch.inference_mode()
-    def predict_logits_from_preprocessed_data(self, data: torch.Tensor, output_file_truncated: str) -> torch.Tensor:
+    def predict_logits_from_preprocessed_data(self, data: torch.Tensor,
+                                              output_file_truncated: str = None) -> torch.Tensor:
         """
         IMPORTANT! IF YOU ARE RUNNING THE CASCADE, THE SEGMENTATION FROM THE PREVIOUS STAGE MUST ALREADY BE STACKED ON
         TOP OF THE IMAGE AS ONE-HOT REPRESENTATION! SEE PreprocessAdapter ON HOW THIS SHOULD BE DONE!
@@ -559,7 +562,7 @@ class nnUNetPredictor(object):
         prediction_per_fold: List[np.ndarray],
         output_file_truncated,
     ):
-        if len(prediction_per_fold) < 2:
+        if len(prediction_per_fold) < 2 or output_file_truncated is None:
             # print('Can\'t predict structure wise dice with only one prediction')
             return
 
@@ -571,6 +574,7 @@ class nnUNetPredictor(object):
         prediction_arg = prediction.argmax(0).numpy().astype(int)
         labels = np.unique(prediction_arg)
         prediction_per_fold_stack = np.stack(prediction_per_fold)
+        n_folds = len(prediction_per_fold)
 
         result = {}
         for label in labels:
@@ -589,13 +593,13 @@ class nnUNetPredictor(object):
             )
 
             v = []  # calculate Coefficient of variation of the volume
-            for i in range(len(labels)):
+            for i in range(n_folds):
                 v.append(np.count_nonzero(pred_fold[i]))
             v = np.array(v)
             CV = np.std(v) / (np.mean(v) + np.finfo(float).eps)
 
             dc = []  # calculate average and median Dice
-            for i in range(len(labels)):
+            for i in range(n_folds):
                 dc.append(metric.dc(pred_fold[i], pred))
             dc = np.array(dc)
             DCA = np.mean(dc)
